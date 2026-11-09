@@ -287,6 +287,9 @@ def main():
         print(msg)
         lines.append(msg)
 
+    if not Path(args.splits_csv).exists():
+        raise SystemExit(f"{args.splits_csv} not found. Pass the split file your run was trained with "
+                         f"(--splits_csv); this script never creates a new split.")
     df = data.scan_dataset(args.data_root)
     train_df, val_df, test_df = data.make_splits(df, args.data_root, split_csv=args.splits_csv)
     class_names = args.classes.split(",") if args.classes else sorted(df["label"].unique())

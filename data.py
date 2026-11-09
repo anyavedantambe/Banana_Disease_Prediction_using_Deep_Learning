@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pandas as pd
 import tensorflow as tf
-from sklearn.model_selection import GroupShuffleSplit, train_test_split
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 import numpy as np
 
@@ -56,15 +56,42 @@ def scan_dataset(root: str) -> pd.DataFrame:
     return df
 
 
-def make_splits(df, root, val_frac=0.15, test_frac=0.15, seed=42, group_col=None, split_csv=None):
+def file_number(rel_path):
+    """Last number in the file name: 'Image_216.jpg' -> 216 (-1 if there is none)."""
+    m = re.findall(r"\d+", Path(rel_path).stem)
+    return int(m[-1]) if m else -1
+
+
+def add_groups(df, block_size):
+    """group = source folder + file-number block, e.g. 'HEALTHY_1|14' for numbers 1400-1499."""
+    df = df.copy()
+    blocks = df["rel_path"].map(file_number) // block_size
+    df["group"] = df["source"] + "|" + blocks.astype(str)
+    return df
+
+
+def _stratified_group_split(df, group_col, frac, seed):
+    """Split off ~frac of the rows as whole groups, keeping class proportions similar."""
+    n = max(2, round(1 / frac))
+    sgkf = StratifiedGroupKFold(n_splits=n, shuffle=True, random_state=seed)
+    keep_idx, held_idx = next(sgkf.split(df, df["label"], groups=df[group_col]))
+    return df.iloc[keep_idx], df.iloc[held_idx]
+
+
+def make_splits(df, root, val_frac=0.15, test_frac=0.15, seed=42, group_col=None, split_csv=None,
+                mode="random", block_size=100, holdout_suffix="2"):
     """Create (or load) a fixed split. The test set is made ONCE and reused by every experiment.
 
-    split_csv stores only relative paths, so commit it to git and reuse it on every machine
-    (laptop, Colab, AWS). If it exists it is loaded as-is; delete it only if the dataset changed.
+    mode:
+      "random"  stratified random split by image (can leak near-duplicate photos across splits)
+      "blocks"  whole (source folder, file-number block) groups stay together; block_size sets the
+                block width. Use when neighboring file numbers look alike (consecutive shots).
+      "folder"  strict holdout: every source folder ending in _<holdout_suffix> (e.g. HEALTHY_2)
+                is the TEST set; train/val come from the other folders, split by blocks.
+    group_col: your own metadata column (farm/plot/session id) instead of "blocks".
 
-    group_col: optional column (e.g. farm/plot/session id) so that images from the same group
-    never straddle train/val/test. The default (None) is a stratified random split, which can
-    leak near-duplicate images across splits -- add metadata and use group_col if you can.
+    split_csv stores only relative paths, so commit it to git and reuse it on every machine.
+    If it exists it is loaded as-is (mode is then ignored); delete it only if the dataset changed.
     """
     root_p = Path(root)
     if split_csv and Path(split_csv).exists():
@@ -82,19 +109,29 @@ def make_splits(df, root, val_frac=0.15, test_frac=0.15, seed=42, group_col=None
         return tuple(full[full["split"] == s].drop(columns="split").reset_index(drop=True)
                      for s in ("train", "val", "test"))
 
-    if group_col is None:
+    val_of_rest = val_frac / (1 - test_frac)
+    if group_col is not None or mode == "blocks":
+        if group_col is None:
+            df, group_col = add_groups(df, block_size), "group"
+        train_val, test = _stratified_group_split(df, group_col, test_frac, seed)
+        train, val = _stratified_group_split(train_val, group_col, val_of_rest, seed)
+    elif mode == "folder":
+        pat = r"[_\- ]" + re.escape(str(holdout_suffix)) + r"$"
+        is_test = df["source"].str.contains(pat, regex=True)
+        test, train_val = df[is_test], df[~is_test]
+        missing_cls = set(df["label"]) - set(test["label"])
+        if missing_cls or train_val.empty:
+            raise ValueError(f"No source folder ending in _{holdout_suffix} for classes {sorted(missing_cls)}. "
+                             f"Folders found: {sorted(df['source'].unique())}")
+        train_val = add_groups(train_val, block_size)
+        train, val = _stratified_group_split(train_val, "group", val_of_rest, seed)
+    elif mode == "random":
         train_val, test = train_test_split(
             df, test_size=test_frac, stratify=df["label"], random_state=seed)
         train, val = train_test_split(
-            train_val, test_size=val_frac / (1 - test_frac),
-            stratify=train_val["label"], random_state=seed)
+            train_val, test_size=val_of_rest, stratify=train_val["label"], random_state=seed)
     else:
-        gss = GroupShuffleSplit(n_splits=1, test_size=test_frac, random_state=seed)
-        tv_idx, test_idx = next(gss.split(df, groups=df[group_col]))
-        train_val, test = df.iloc[tv_idx], df.iloc[test_idx]
-        gss2 = GroupShuffleSplit(n_splits=1, test_size=val_frac / (1 - test_frac), random_state=seed)
-        tr_idx, va_idx = next(gss2.split(train_val, groups=train_val[group_col]))
-        train, val = train_val.iloc[tr_idx], train_val.iloc[va_idx]
+        raise ValueError(f"Unknown split mode: {mode}")
 
     if split_csv:
         cols = ["rel_path", "label", "source"]
@@ -103,8 +140,13 @@ def make_splits(df, root, val_frac=0.15, test_frac=0.15, seed=42, group_col=None
                          test[cols].assign(split="test")])
         Path(split_csv).parent.mkdir(parents=True, exist_ok=True)
         out.to_csv(split_csv, index=False)
-        print(f"Saved new split to {split_csv} (commit this file to git).")
-    return tuple(d.reset_index(drop=True) for d in (train, val, test))
+        print(f"Saved new '{mode}' split to {split_csv} (commit this file to git).")
+    parts = [d.reset_index(drop=True) for d in (train, val, test)]
+    print(f"Split sizes: train={len(parts[0])} val={len(parts[1])} test={len(parts[2])}")
+    print(pd.crosstab(pd.concat([p["label"] for p in parts], ignore_index=True),
+                      pd.concat([p.assign(s=n)["s"] for p, n in zip(parts, ("train", "val", "test"))],
+                                ignore_index=True))[["train", "val", "test"]].to_string())
+    return tuple(parts)
 
 
 def subsample_per_class(df, n, seed=42):

@@ -34,7 +34,13 @@ def parse_args():
     p.add_argument("--data_root", required=True)
     p.add_argument("--run_name", default="vgg16_run")
     p.add_argument("--out_root", default="results", help="where run folders are written")
-    p.add_argument("--splits_csv", default="splits/splits.csv", help="fixed split; commit it to git")
+    p.add_argument("--split_mode", default="random", choices=["random", "blocks", "folder"],
+                   help="random = by image; blocks = keep (folder, file-number block) groups together; "
+                        "folder = hold out whole _<holdout_suffix> folders as the test set")
+    p.add_argument("--block_size", type=int, default=100, help="file-number block width for grouped splits")
+    p.add_argument("--holdout_suffix", default="2", help="folder mode: folders ending _<this> become the test set")
+    p.add_argument("--splits_csv", default=None,
+                   help="fixed split file; default depends on --split_mode. Commit it to git.")
     p.add_argument("--classes", default=None, help="comma-separated; default = all classes found")
     p.add_argument("--img_size", type=int, default=224)
     p.add_argument("--batch_size", type=int, default=32)
@@ -117,7 +123,14 @@ def main():
 
     # ---- data: the split is fixed and shared by ALL experiments ----
     df = data.scan_dataset(args.data_root)
-    train_df, val_df, test_df = data.make_splits(df, args.data_root, split_csv=args.splits_csv)
+    if args.splits_csv is None:
+        args.splits_csv = {"random": "splits/splits.csv",
+                           "blocks": f"splits/splits_blocks{args.block_size}.csv",
+                           "folder": f"splits/splits_folder{args.holdout_suffix}.csv"}[args.split_mode]
+    print("Using split file:", args.splits_csv)
+    train_df, val_df, test_df = data.make_splits(
+        df, args.data_root, split_csv=args.splits_csv, mode=args.split_mode,
+        block_size=args.block_size, holdout_suffix=args.holdout_suffix)
     if args.max_per_class:
         train_df, val_df, test_df = (data.subsample_per_class(d, args.max_per_class, args.seed)
                                      for d in (train_df, val_df, test_df))
