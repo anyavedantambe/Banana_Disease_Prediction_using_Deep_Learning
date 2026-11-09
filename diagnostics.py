@@ -13,6 +13,7 @@ How to read the results is explained in the printed summary and the README text 
 of each section. Nothing here proves leakage by itself: the image grids are the real evidence.
 """
 import argparse
+import re
 from pathlib import Path
 
 import matplotlib
@@ -166,6 +167,43 @@ def check_neighbors(model, train_df, test_df, class_names, img_size, batch_size,
             f"{100 * (best_sim >= thr).mean():.1f}%")
     diff_hi = int(((best_sim >= 0.9) & ~same).sum())
     log(f"  very similar neighbors with a DIFFERENT class (possible label noise): {diff_hi}")
+
+    # --- do visually similar images have nearby filename numbers? (e.g. Image_216 vs Image_217) ---
+    def img_num(rel):
+        m = re.findall(r"\d+", Path(rel).stem)
+        return float(m[-1]) if m else np.nan
+
+    te_n = te["rel_path"].map(img_num).values
+    tr_n = tr["rel_path"].map(img_num).values
+    gap = np.abs(te_n - tr_n[best_idx])
+    pd.DataFrame({
+        "test_file": te["rel_path"], "test_label": te["label"], "test_num": te_n,
+        "nn_train_file": tr["rel_path"].values[best_idx], "nn_train_label": tr["label"].values[best_idx],
+        "nn_train_num": tr_n[best_idx], "similarity": best_sim, "number_gap": gap,
+    }).sort_values("similarity", ascending=False).to_csv(out / "nn_pairs.csv", index=False)
+    log("\n--- Filename numbers of nearest-neighbor pairs (full table: nn_pairs.csv) ---")
+    if np.isnan(gap).mean() > 0.5:
+        log("Could not read a number from most filenames, skipping this check.")
+    else:
+        rng = np.random.default_rng(seed)
+        rand_gap = np.full(len(te), np.nan)
+        for cls in class_names:  # baseline: a RANDOM training image of the same class
+            ti = np.where(te["label"].values == cls)[0]
+            ri = np.where(tr["label"].values == cls)[0]
+            rand_gap[ti] = np.abs(te_n[ti] - tr_n[rng.choice(ri, len(ti))])
+        log(f"{'filename-number gap <=':<26}{'nearest neighbor':>18}{'random same-class':>20}")
+        for k in (5, 20, 100):
+            log(f"{k:<26}{100 * np.nanmean(gap <= k):>17.1f}%{100 * np.nanmean(rand_gap <= k):>19.1f}%")
+        log(f"{'median gap':<26}{np.nanmedian(gap):>18.0f}{np.nanmedian(rand_gap):>20.0f}")
+        log("Ten most similar pairs (test file number -> its nearest train file number):")
+        top = np.argsort(-best_sim)[:10]
+        for j in top:
+            log(f"  sim {best_sim[j]:.3f}  {te['rel_path'].iloc[j]} -> {tr['rel_path'].values[best_idx[j]]}"
+                f"  (gap {gap[j]:.0f})")
+        log("README: if nearest neighbors are far more often within a few numbers of each other than random\n"
+            "same-class images, then neighboring file numbers look alike (probably consecutive shots of the\n"
+            "same scene). A random split then puts such neighbors into train AND test: that is leakage.\n"
+            "If both columns look similar, file numbers carry no visual meaning and you can drop this worry.")
 
     fig, ax = plt.subplots(figsize=(7, 4))
     for cls in class_names:
