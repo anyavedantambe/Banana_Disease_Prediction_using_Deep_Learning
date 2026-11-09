@@ -1,0 +1,7 @@
+tensorflow>=2.15
+numpy
+pandas
+scikit-learn
+pillow
+matplotlib
+keras-tuner

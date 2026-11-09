@@ -1,0 +1,9 @@
+# big or machine-specific: never commit
+data/
+results/
+*.keras
+*.npy
+__pycache__/
+.venv/
+.idea/
+# NOTE: splits/splits.csv is small and portable -- DO commit it.
