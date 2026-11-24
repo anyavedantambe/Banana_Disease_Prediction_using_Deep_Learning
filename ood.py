@@ -39,10 +39,11 @@ def softmax(logits):
     return e / e.sum(axis=1, keepdims=True)
 
 
-def forward(model, df, class_names, img_size, batch_size):
+def forward(model, df, class_names, img_size, batch_size, backbone="vgg16"):
     """One pass in normal prediction mode (dropout OFF). Returns (features, logits) in df row order."""
     two_out = keras.Model(model.inputs, [model.get_layer("features").output, model.output])
-    ds = data.make_dataset(df, class_names, img_size=img_size, batch_size=batch_size, training=False)
+    ds = data.make_dataset(df, class_names, img_size=img_size, batch_size=batch_size, training=False,
+                           backbone=backbone)
     feats, logits = two_out.predict(ds, verbose=0)
     return feats, logits
 
@@ -71,6 +72,7 @@ def main():
     ap.add_argument("--unknown", default=None, help="comma-separated unknown classes (default: all non-known)")
     ap.add_argument("--keep", type=float, default=0.95, help="share of known validation images the threshold accepts")
     ap.add_argument("--img_size", type=int, default=None)
+    ap.add_argument("--backbone", default=None, help="encoder the run used (default: from history.json, else vgg16)")
     ap.add_argument("--batch_size", type=int, default=64)
     args = ap.parse_args()
 
@@ -87,6 +89,7 @@ def main():
     known = classes.split(",") if isinstance(classes, str) else list(classes)
     splits_csv = args.splits_csv or saved.get("splits_csv") or "splits/splits.csv"
     img_size = args.img_size or saved.get("img_size", 224)
+    backbone = args.backbone or saved.get("backbone", "vgg16")  # runs from before --backbone existed were VGG16
     if not Path(splits_csv).exists():
         raise SystemExit(f"{splits_csv} not found. Pass --splits_csv (the file the run was trained with); "
                          f"this script never creates a new split.")
@@ -105,7 +108,7 @@ def main():
     all_names = known + unknown
     log(f"Known classes:   {known}")
     log(f"Unknown classes: {unknown}")
-    log(f"Split file: {splits_csv}")
+    log(f"Split file: {splits_csv}   Backbone: {backbone}")
 
     model = keras.models.load_model(run_dir / "model.keras")
     if model.output_shape[-1] != len(known):
@@ -114,19 +117,19 @@ def main():
 
     # ---- class averages from TRAINING images of the known classes ----
     tr_known = train_df[train_df["label"].isin(known)].reset_index(drop=True)
-    f_tr, _ = forward(model, tr_known, known, img_size, args.batch_size)
+    f_tr, _ = forward(model, tr_known, known, img_size, args.batch_size, backbone)
     y_tr = tr_known["label"].map({c: i for i, c in enumerate(known)}).values
     centroids = np.stack([f_tr[y_tr == i].mean(axis=0) for i in range(len(known))])
 
     # ---- thresholds from VALIDATION images of the KNOWN classes only ----
     va_known = val_df[val_df["label"].isin(known)].reset_index(drop=True)
-    f_va, l_va = forward(model, va_known, known, img_size, args.batch_size)
+    f_va, l_va = forward(model, va_known, known, img_size, args.batch_size, backbone)
     val_scores = compute_scores(f_va, l_va, centroids, len(known))
     thr = {k: float(np.quantile(v, args.keep)) for k, v in val_scores.items()}
 
     # ---- score the TEST set: known + unknown ----
     te = test_df[test_df["label"].isin(all_names)].reset_index(drop=True)
-    f_te, l_te = forward(model, te, all_names, img_size, args.batch_size)
+    f_te, l_te = forward(model, te, all_names, img_size, args.batch_size, backbone)
     scores = compute_scores(f_te, l_te, centroids, len(known))
     probs = softmax(l_te)
     is_unk = ~te["label"].isin(known).values
@@ -179,7 +182,7 @@ def main():
     log("(known flagged should be near " + pct(1 - args.keep) + " if validation and test behave alike; "
         "'acc. of accepted' = closed-set accuracy on known test images the detector did not flag)")
     (out / "ood_results.json").write_text(json.dumps(
-        {"known": known, "unknown": unknown, "keep": args.keep, "splits_csv": splits_csv,
+        {"known": known, "unknown": unknown, "keep": args.keep, "splits_csv": splits_csv, "backbone": backbone,
          "n_known_test": n_kn, "n_unknown_test": n_unk, "closed_set_accuracy": float(known_correct.mean()),
          "scores": results}, indent=2))
 

@@ -21,6 +21,8 @@ from sklearn.model_selection import StratifiedGroupKFold, train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 import numpy as np
 
+import backbones
+
 IMG_EXTS = {".jpg", ".jpeg", ".png"}
 CROP_SCALE = 1.15  # training images are loaded 15% larger, then randomly cropped
 AUTOTUNE = tf.data.AUTOTUNE
@@ -165,20 +167,21 @@ def class_weights(df, class_names):
 # ----------------------------------------------------------------------------
 # tf.data pipeline
 # ----------------------------------------------------------------------------
-def preprocess(img):
-    """VGG16 preprocessing (RGB->BGR, ImageNet mean subtraction). Input: float32 in [0, 255].
-    Any inference code later (OOD scoring, new images) must apply this same function."""
-    return tf.keras.applications.vgg16.preprocess_input(img)
+def preprocess(img, backbone="vgg16"):
+    """Preprocess a float32 [0, 255] image tensor for the given backbone (see backbones.py).
+    Any inference code later (new images, deployment) must apply the same function."""
+    return backbones.get(backbone).preprocess(img)
 
 
 def make_dataset(df, class_names, img_size=224, batch_size=32, training=False,
-                 cache=False, seed=42):
+                 cache=False, seed=42, backbone="vgg16"):
     """Build a batched dataset of (preprocessed image, integer label).
 
     class_names defines the label order AND which classes are included, so the same function
     handles the full 3-class problem and the held-out-class experiments later:
         class_names=["healthy", "black_sigatoka"]  # fusarium_wilt rows are dropped here
     Evaluation datasets are NOT shuffled, so predictions line up with df's row order.
+    backbone: which encoder's preprocessing to apply (see backbones.py).
     """
     df = df[df["label"].isin(class_names)]
     idx = {c: i for i, c in enumerate(class_names)}
@@ -212,5 +215,6 @@ def make_dataset(df, class_names, img_size=224, batch_size=32, training=False,
         if training:
             ds = ds.shuffle(1000, seed=seed, reshuffle_each_iteration=True)
     ds = ds.map(_augment if training else _to_float, num_parallel_calls=AUTOTUNE)
-    ds = ds.map(lambda x, y: (preprocess(x), y), num_parallel_calls=AUTOTUNE)
+    pre = backbones.get(backbone).preprocess  # each encoder expects its own input scaling
+    ds = ds.map(lambda x, y: (pre(x), y), num_parallel_calls=AUTOTUNE)
     return ds.batch(batch_size).prefetch(AUTOTUNE)

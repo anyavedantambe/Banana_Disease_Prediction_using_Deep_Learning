@@ -12,12 +12,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 
+import backbones
 import data
 
 p = argparse.ArgumentParser()
 p.add_argument("--data_root", required=True)
 p.add_argument("--splits_csv", default="splits/splits.csv")
 p.add_argument("--img_size", type=int, default=224)
+p.add_argument("--backbone", default="vgg16", choices=sorted(backbones.BACKBONES))
 args = p.parse_args()
 
 print("TensorFlow", tf.__version__, "| GPUs:", tf.config.list_physical_devices("GPU") or "none (CPU only)")
@@ -28,12 +30,12 @@ print(f"\nSplit sizes: train={len(train_df)} val={len(val_df)} test={len(test_df
 print("Test set per class:\n" + test_df.groupby("label").size().to_string())
 
 class_names = sorted(df["label"].unique())
-ds = data.make_dataset(train_df, class_names, img_size=args.img_size, batch_size=12, training=True)
+ds = data.make_dataset(train_df, class_names, img_size=args.img_size, batch_size=12, training=True,
+                       backbone=args.backbone)
 x, y = next(iter(ds))
 print(f"\nBatch: images {x.shape} {x.dtype}, labels {y.numpy().tolist()}")
 
-mean_bgr = np.array([103.939, 116.779, 123.68])  # undo VGG16 preprocessing for display only
-imgs = np.clip((x.numpy() + mean_bgr)[..., ::-1], 0, 255).astype("uint8")
+imgs = backbones.get(args.backbone).deprocess(x.numpy())  # undo preprocessing for display only
 fig, axes = plt.subplots(3, 4, figsize=(10, 8))
 for ax, im, lab in zip(axes.ravel(), imgs, y.numpy()):
     ax.imshow(im); ax.set_title(class_names[lab], fontsize=9); ax.axis("off")

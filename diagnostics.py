@@ -13,6 +13,7 @@ How to read the results is explained in the printed summary and the README text 
 of each section. Nothing here proves leakage by itself: the image grids are the real evidence.
 """
 import argparse
+import json
 import re
 from pathlib import Path
 
@@ -51,18 +52,20 @@ def image_grid(items, path, ncols=6, title=None):
     plt.close(fig)
 
 
-def predict_probs(model, df, class_names, img_size, batch_size):
-    ds = data.make_dataset(df, class_names, img_size=img_size, batch_size=batch_size, training=False)
+def predict_probs(model, df, class_names, img_size, batch_size, backbone="vgg16"):
+    ds = data.make_dataset(df, class_names, img_size=img_size, batch_size=batch_size, training=False,
+                           backbone=backbone)
     logits = model.predict(ds, verbose=0)
     e = np.exp(logits - logits.max(axis=1, keepdims=True))
     return e / e.sum(axis=1, keepdims=True)
 
 
-def embeddings(model, df, class_names, img_size, batch_size):
+def embeddings(model, df, class_names, img_size, batch_size, backbone="vgg16"):
     """512-d global-average-pooled VGG16 features (before the task-specific head)."""
     gap = next(l for l in model.layers if isinstance(l, layers.GlobalAveragePooling2D))
     emb_model = keras.Model(model.inputs, gap.output)
-    ds = data.make_dataset(df, class_names, img_size=img_size, batch_size=batch_size, training=False)
+    ds = data.make_dataset(df, class_names, img_size=img_size, batch_size=batch_size, training=False,
+                           backbone=backbone)
     return emb_model.predict(ds, verbose=0)
 
 
@@ -142,12 +145,12 @@ def check_errors(test_df, probs, class_names, out, log, seed):
 # ----------------------------------------------------------------------------
 # 3. near-duplicates
 # ----------------------------------------------------------------------------
-def check_neighbors(model, train_df, test_df, class_names, img_size, batch_size, out, log, seed):
+def check_neighbors(model, train_df, test_df, class_names, img_size, batch_size, out, log, seed, backbone="vgg16"):
     tr = train_df[train_df["label"].isin(class_names)].reset_index(drop=True)
     te = test_df[test_df["label"].isin(class_names)].reset_index(drop=True)
     log("\n=== 3. NEAR-DUPLICATES (nearest training image for each test image) ===")
-    f_tr = embeddings(model, tr, class_names, img_size, batch_size)
-    f_te = embeddings(model, te, class_names, img_size, batch_size)
+    f_tr = embeddings(model, tr, class_names, img_size, batch_size, backbone)
+    f_te = embeddings(model, te, class_names, img_size, batch_size, backbone)
     mu = f_tr.mean(0, keepdims=True)  # center first: raw post-ReLU features all look similar
     f_tr, f_te = f_tr - mu, f_te - mu
     f_tr /= np.linalg.norm(f_tr, axis=1, keepdims=True) + 1e-8
@@ -269,9 +272,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data_root", required=True)
     ap.add_argument("--run_dir", required=True, help="folder containing model.keras")
-    ap.add_argument("--splits_csv", default="splits/splits.csv")
-    ap.add_argument("--classes", default=None, help="comma-separated, same order as training")
-    ap.add_argument("--img_size", type=int, default=224)
+    ap.add_argument("--splits_csv", default=None, help="default: the split file recorded in the run")
+    ap.add_argument("--classes", default=None, help="comma-separated, same order as training (default: from the run)")
+    ap.add_argument("--img_size", type=int, default=None, help="default: from the run, else 224")
+    ap.add_argument("--backbone", default=None, help="encoder the run used (default: from history.json, else vgg16)")
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--skip_neighbors", action="store_true")
     ap.add_argument("--skip_probe", action="store_true")
@@ -279,6 +283,13 @@ def main():
     args = ap.parse_args()
 
     run_dir = Path(args.run_dir)
+    saved = {}
+    if (run_dir / "history.json").exists():
+        saved = json.loads((run_dir / "history.json").read_text()).get("args", {})
+    backbone = args.backbone or saved.get("backbone", "vgg16")  # older runs were VGG16
+    args.splits_csv = args.splits_csv or saved.get("splits_csv") or "splits/splits.csv"
+    args.img_size = args.img_size or saved.get("img_size", 224)
+    args.classes = args.classes or saved.get("classes")  # None = trained on all classes
     out = run_dir / "diagnostics"
     out.mkdir(parents=True, exist_ok=True)
     lines = []
@@ -294,13 +305,17 @@ def main():
     train_df, val_df, test_df = data.make_splits(df, args.data_root, split_csv=args.splits_csv)
     class_names = args.classes.split(",") if args.classes else sorted(df["label"].unique())
     model = keras.models.load_model(run_dir / "model.keras")
+    if model.output_shape[-1] != len(class_names):
+        raise SystemExit(f"The model has {model.output_shape[-1]} outputs but {len(class_names)} classes were "
+                         f"given ({class_names}). Pass --classes exactly as used in training.")
+    print(f"Classes: {class_names} | split: {args.splits_csv} | backbone: {backbone} | img_size: {args.img_size}")
 
     check_sources(train_df, val_df, test_df, out, log)
     probs = predict_probs(model, test_df[test_df["label"].isin(class_names)], class_names,
-                          args.img_size, args.batch_size)
+                          args.img_size, args.batch_size, backbone)
     check_errors(test_df, probs, class_names, out, log, args.seed)
     if not args.skip_neighbors:
-        check_neighbors(model, train_df, test_df, class_names, args.img_size, args.batch_size, out, log, args.seed)
+        check_neighbors(model, train_df, test_df, class_names, args.img_size, args.batch_size, out, log, args.seed, backbone)
     if not args.skip_probe:
         check_probe(train_df, test_df, class_names, out, log)
 

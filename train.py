@@ -1,9 +1,10 @@
-"""Two-phase transfer learning (train head, then fine-tune top of VGG16) with resume support.
+"""Two-phase transfer learning (train head, then fine-tune top of the encoder) with resume support.
 
 Example (PyCharm: Run > Edit Configurations > Parameters):
     --data_root data/banana_small --run_name vgg16_3class
 Quick pipeline check:
     --data_root data/banana_small --run_name smoke --max_per_class 60 --epochs1 1 --epochs2 1
+Pick the encoder with --backbone (default vgg16; see backbones.py).
 Closed-set run for a holdout experiment later (fusarium_wilt rows are excluded from training):
     --data_root data/banana_small --run_name holdout_fusarium --classes healthy,black_sigatoka
 On Colab, keep results on Drive so a disconnect loses nothing:
@@ -25,6 +26,7 @@ import tensorflow as tf
 from sklearn.metrics import classification_report, confusion_matrix
 from tensorflow import keras
 
+import backbones
 import data
 import models
 
@@ -50,7 +52,11 @@ def parse_args():
     p.add_argument("--lr2", type=float, default=1e-5)
     p.add_argument("--dropout", type=float, default=0.5)
     p.add_argument("--head_units", type=int, default=256)
-    p.add_argument("--unfreeze", default="block5", help="comma-separated, e.g. block5,block4")
+    p.add_argument("--backbone", default="vgg16", choices=sorted(backbones.BACKBONES),
+                   help="pretrained encoder (see backbones.py)")
+    p.add_argument("--unfreeze", default=None,
+                   help="phase-2 layers: 'block5' or 'block5,block4' (VGG16 blocks), or 'last:N'. "
+                        "Default depends on the backbone.")
     p.add_argument("--weights", default="imagenet", help="'imagenet' or 'none' (for offline tests)")
     p.add_argument("--max_per_class", type=int, default=None, help="subsample for smoke tests")
     p.add_argument("--cache", action="store_true", help="cache resized images in RAM")
@@ -111,6 +117,8 @@ def callbacks(out_dir, state, phase, patience):
 
 def main():
     args = parse_args()
+    if args.unfreeze is None:
+        args.unfreeze = backbones.get(args.backbone).default_unfreeze  # saved in history.json too
     set_seed(args.seed)
     out_dir = Path(args.out_root) / args.run_name
     if args.fresh and out_dir.exists():
@@ -138,12 +146,13 @@ def main():
     print("Classes:", class_names)
     print(df.groupby("label").size().to_string())
 
-    kw = dict(img_size=args.img_size, batch_size=args.batch_size, cache=args.cache, seed=args.seed)
+    kw = dict(img_size=args.img_size, batch_size=args.batch_size, cache=args.cache, seed=args.seed,
+              backbone=args.backbone)
     train_ds = data.make_dataset(train_df, class_names, training=True, **kw)
     val_ds = data.make_dataset(val_df, class_names, training=False, **kw)
     test_ds = data.make_dataset(test_df, class_names, training=False, **kw)
     cw = data.class_weights(train_df, class_names)
-    unfreeze = tuple(args.unfreeze.split(","))
+    unfreeze = args.unfreeze
 
     # ---- PHASE 1: backbone frozen, train only the new head ----
     if not state.d["phase1_done"]:
@@ -152,7 +161,7 @@ def main():
         else:
             state.d["epochs_done"] = 0
             state.d["history"]["phase1"] = []
-            model, _ = models.build_vgg16(len(class_names), args.img_size, args.head_units,
+            model, _ = models.build_model(args.backbone, len(class_names), args.img_size, args.head_units,
                                           args.dropout, None if args.weights == "none" else args.weights)
             models.compile_model(model, args.lr1)
         model.fit(train_ds, validation_data=val_ds, epochs=args.epochs1,
@@ -166,10 +175,10 @@ def main():
     if not state.d["phase2_done"]:
         if state.d["epochs_done"] > 0 and (out_dir / "last.keras").exists():
             model = keras.models.load_model(out_dir / "last.keras")  # mid-phase-2 resume
-            models.unfreeze_blocks(models.get_base(model), unfreeze)
+            models.unfreeze(models.get_base(model), unfreeze)
         else:
             model = keras.models.load_model(out_dir / "phase1_final.keras")
-            models.unfreeze_blocks(models.get_base(model), unfreeze)
+            models.unfreeze(models.get_base(model), unfreeze)
             models.compile_model(model, args.lr2)  # recompiling is required after changing trainable flags
             state.d["history"]["phase2"] = []
             state.d["epochs_done"] = 0
