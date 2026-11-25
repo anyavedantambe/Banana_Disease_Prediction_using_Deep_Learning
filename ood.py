@@ -87,7 +87,9 @@ def main():
         raise SystemExit("Known classes unknown: this run trained on ALL classes (no holdout). "
                          "Pass --classes, or train with --classes first.")
     known = classes.split(",") if isinstance(classes, str) else list(classes)
-    splits_csv = args.splits_csv or saved.get("splits_csv") or "splits/splits.csv"
+    own_split = run_dir / "split_used.csv"  # runs made after this feature keep their own copy
+    splits_csv = args.splits_csv or (str(own_split) if own_split.exists() else None) \
+        or saved.get("splits_csv") or "splits/splits.csv"
     img_size = args.img_size or saved.get("img_size", 224)
     backbone = args.backbone or saved.get("backbone", "vgg16")  # runs from before --backbone existed were VGG16
     if not Path(splits_csv).exists():

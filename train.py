@@ -10,6 +10,9 @@ Closed-set run for a holdout experiment later (fusarium_wilt rows are excluded f
 On Colab, keep results on Drive so a disconnect loses nothing:
     --out_root /content/drive/MyDrive/banana_results
 
+SPLITS: a missing split file is an error unless you pass --create_split. Each run keeps a copy
+of the split it used (split_used.csv) and records the per-class counts in history.json.
+
 RESUMING: if the process dies (Colab disconnect, closed laptop), run the SAME command again and
 it continues from the last finished epoch. Use --fresh to discard a run and start over. Don't
 change hyperparameters between a stop and a resume; use a new --run_name instead.
@@ -60,6 +63,9 @@ def parse_args():
     p.add_argument("--weights", default="imagenet", help="'imagenet' or 'none' (for offline tests)")
     p.add_argument("--max_per_class", type=int, default=None, help="subsample for smoke tests")
     p.add_argument("--cache", action="store_true", help="cache resized images in RAM")
+    p.add_argument("--create_split", action="store_true",
+                   help="allow creating the split file if it doesn't exist. Without this flag a missing "
+                        "split file is an ERROR, so a run can never silently use a new, different split.")
     p.add_argument("--fresh", action="store_true", help="delete any saved progress for this run")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -119,6 +125,18 @@ def main():
     args = parse_args()
     if args.unfreeze is None:
         args.unfreeze = backbones.get(args.backbone).default_unfreeze  # saved in history.json too
+    if args.splits_csv is None:
+        args.splits_csv = {"random": "splits/splits.csv",
+                           "blocks": f"splits/splits_blocks{args.block_size}.csv",
+                           "folder": f"splits/splits_folder{args.holdout_suffix}.csv"}[args.split_mode]
+    if not Path(args.splits_csv).exists() and not args.create_split:
+        raise SystemExit(
+            f"\nSTOPPED: split file '{args.splits_csv}' does not exist in this folder.\n"
+            f"Without it this run would silently create a NEW split, and your results would not be "
+            f"comparable with earlier runs.\n"
+            f"  - If it should exist, it is probably not in git yet: commit it, push, and pull here.\n"
+            f"  - If you really want a new split (first time, or a new dataset), add --create_split.\n"
+            f"Files in splits/: {sorted(p.name for p in Path('splits').glob('*.csv')) if Path('splits').exists() else 'no splits folder'}")
     set_seed(args.seed)
     out_dir = Path(args.out_root) / args.run_name
     if args.fresh and out_dir.exists():
@@ -131,14 +149,14 @@ def main():
 
     # ---- data: the split is fixed and shared by ALL experiments ----
     df = data.scan_dataset(args.data_root)
-    if args.splits_csv is None:
-        args.splits_csv = {"random": "splits/splits.csv",
-                           "blocks": f"splits/splits_blocks{args.block_size}.csv",
-                           "folder": f"splits/splits_folder{args.holdout_suffix}.csv"}[args.split_mode]
     print("Using split file:", args.splits_csv)
     train_df, val_df, test_df = data.make_splits(
         df, args.data_root, split_csv=args.splits_csv, mode=args.split_mode,
         block_size=args.block_size, holdout_suffix=args.holdout_suffix)
+    shutil.copy(args.splits_csv, out_dir / "split_used.csv")  # the exact split this run used
+    split_counts = {n: d.groupby("label").size().to_dict()
+                    for n, d in (("train", train_df), ("val", val_df), ("test", test_df))}
+    print("Test images per class:", split_counts["test"])
     if args.max_per_class:
         train_df, val_df, test_df = (data.subsample_per_class(d, args.max_per_class, args.seed)
                                      for d in (train_df, val_df, test_df))
@@ -206,7 +224,7 @@ def main():
     (out_dir / "report.txt").write_text(report + "\n" + np.array2string(cm))
     hist = {ph: {k: [e[k] for e in epochs] for k in epochs[0]} if epochs else {}
             for ph, epochs in state.d["history"].items()}
-    (out_dir / "history.json").write_text(json.dumps({**hist, "args": vars(args)}, indent=2))
+    (out_dir / "history.json").write_text(json.dumps({**hist, "args": vars(args), "split_counts": split_counts}, indent=2))
     for f in ("last.keras", "last.tmp.keras"):  # no longer needed once the run is complete
         (out_dir / f).unlink(missing_ok=True)
     print("Saved to", out_dir)

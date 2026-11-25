@@ -287,7 +287,9 @@ def main():
     if (run_dir / "history.json").exists():
         saved = json.loads((run_dir / "history.json").read_text()).get("args", {})
     backbone = args.backbone or saved.get("backbone", "vgg16")  # older runs were VGG16
-    args.splits_csv = args.splits_csv or saved.get("splits_csv") or "splits/splits.csv"
+    own_split = run_dir / "split_used.csv"  # runs made after this feature keep their own copy
+    args.splits_csv = args.splits_csv or (str(own_split) if own_split.exists() else None) \
+        or saved.get("splits_csv") or "splits/splits.csv"
     args.img_size = args.img_size or saved.get("img_size", 224)
     args.classes = args.classes or saved.get("classes")  # None = trained on all classes
     out = run_dir / "diagnostics"
