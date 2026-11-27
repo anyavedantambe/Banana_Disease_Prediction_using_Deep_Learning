@@ -1,0 +1,220 @@
+"""Data utilities: scan folders, make a FIXED train/val/test split, build tf.data pipelines.
+
+Expected layout (unzip and put the class folders under one root):
+
+    data/banana/
+        HEALTHY-1/        -> class "healthy"
+        HEALTHY-2/
+        BLACK SIGATOKA-1/ -> class "black_sigatoka"
+        FUSARIUM WILT-1/  -> class "fusarium_wilt"
+        ...
+
+Folder names are normalized: trailing numbers are stripped, spaces become underscores,
+everything is lowercased. Images may be nested anywhere inside each folder.
+"""
+import re
+from pathlib import Path
+
+import pandas as pd
+import tensorflow as tf
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+import numpy as np
+
+import backbones
+
+IMG_EXTS = {".jpg", ".jpeg", ".png"}
+CROP_SCALE = 1.15  # training images are loaded 15% larger, then randomly cropped
+AUTOTUNE = tf.data.AUTOTUNE
+
+
+# ----------------------------------------------------------------------------
+# Scanning and splitting
+# ----------------------------------------------------------------------------
+def normalize_class_name(folder_name: str) -> str:
+    name = re.sub(r"[\s_-]*\d+$", "", folder_name.strip())  # "FUSARIUM WILT-2" -> "FUSARIUM WILT"
+    return re.sub(r"[\s-]+", "_", name).lower()
+
+
+def scan_dataset(root: str) -> pd.DataFrame:
+    """Return a DataFrame with columns: rel_path, label, source, path.
+
+    rel_path is relative to `root` (forward slashes) and is what gets stored in splits.csv, so the
+    split file works on any machine. `path` is the full path on THIS machine. Rows are sorted by
+    rel_path so the same seed gives the same split everywhere.
+    """
+    root_p = Path(root)
+    rows = []
+    for class_dir in sorted(p for p in root_p.iterdir() if p.is_dir()):
+        label = normalize_class_name(class_dir.name)
+        for p in class_dir.rglob("*"):
+            if p.suffix.lower() in IMG_EXTS:
+                rows.append({"rel_path": p.relative_to(root_p).as_posix(),
+                             "label": label, "source": class_dir.name})
+    if not rows:
+        raise FileNotFoundError(f"No images found under {root}")
+    df = pd.DataFrame(rows).sort_values("rel_path").reset_index(drop=True)
+    df["path"] = [str(root_p / r) for r in df["rel_path"]]
+    return df
+
+
+def file_number(rel_path):
+    """Last number in the file name: 'Image_216.jpg' -> 216 (-1 if there is none)."""
+    m = re.findall(r"\d+", Path(rel_path).stem)
+    return int(m[-1]) if m else -1
+
+
+def add_groups(df, block_size):
+    """group = source folder + file-number block, e.g. 'HEALTHY_1|14' for numbers 1400-1499."""
+    df = df.copy()
+    blocks = df["rel_path"].map(file_number) // block_size
+    df["group"] = df["source"] + "|" + blocks.astype(str)
+    return df
+
+
+def _stratified_group_split(df, group_col, frac, seed):
+    """Split off ~frac of the rows as whole groups, keeping class proportions similar."""
+    n = max(2, round(1 / frac))
+    sgkf = StratifiedGroupKFold(n_splits=n, shuffle=True, random_state=seed)
+    keep_idx, held_idx = next(sgkf.split(df, df["label"], groups=df[group_col]))
+    return df.iloc[keep_idx], df.iloc[held_idx]
+
+
+def make_splits(df, root, val_frac=0.15, test_frac=0.15, seed=42, group_col=None, split_csv=None,
+                mode="random", block_size=100, holdout_suffix="2"):
+    """Create (or load) a fixed split. The test set is made ONCE and reused by every experiment.
+
+    mode:
+      "random"  stratified random split by image (can leak near-duplicate photos across splits)
+      "blocks"  whole (source folder, file-number block) groups stay together; block_size sets the
+                block width. Use when neighboring file numbers look alike (consecutive shots).
+      "folder"  strict holdout: every source folder ending in _<holdout_suffix> (e.g. HEALTHY_2)
+                is the TEST set; train/val come from the other folders, split by blocks.
+    group_col: your own metadata column (farm/plot/session id) instead of "blocks".
+
+    split_csv stores only relative paths, so commit it to git and reuse it on every machine.
+    If it exists it is loaded as-is (mode is then ignored); delete it only if the dataset changed.
+    """
+    root_p = Path(root)
+    if split_csv and Path(split_csv).exists():
+        full = pd.read_csv(split_csv)
+        full["path"] = [str(root_p / r) for r in full["rel_path"]]
+        missing = [p for p in full["path"] if not Path(p).exists()]
+        if missing:
+            raise FileNotFoundError(
+                f"{len(missing)} files listed in {split_csv} were not found under {root} "
+                f"(e.g. {missing[0]}). Wrong --data_root, or the dataset changed? "
+                f"If the dataset changed, delete {split_csv} to create a new split.")
+        extra = len(df) - len(full)
+        if extra > 0:
+            print(f"Note: {extra} images under {root} are not in {split_csv} and will be ignored.")
+        return tuple(full[full["split"] == s].drop(columns="split").reset_index(drop=True)
+                     for s in ("train", "val", "test"))
+
+    val_of_rest = val_frac / (1 - test_frac)
+    if group_col is not None or mode == "blocks":
+        if group_col is None:
+            df, group_col = add_groups(df, block_size), "group"
+        train_val, test = _stratified_group_split(df, group_col, test_frac, seed)
+        train, val = _stratified_group_split(train_val, group_col, val_of_rest, seed)
+    elif mode == "folder":
+        pat = r"[_\- ]" + re.escape(str(holdout_suffix)) + r"$"
+        is_test = df["source"].str.contains(pat, regex=True)
+        test, train_val = df[is_test], df[~is_test]
+        missing_cls = set(df["label"]) - set(test["label"])
+        if missing_cls or train_val.empty:
+            raise ValueError(f"No source folder ending in _{holdout_suffix} for classes {sorted(missing_cls)}. "
+                             f"Folders found: {sorted(df['source'].unique())}")
+        train_val = add_groups(train_val, block_size)
+        train, val = _stratified_group_split(train_val, "group", val_of_rest, seed)
+    elif mode == "random":
+        train_val, test = train_test_split(
+            df, test_size=test_frac, stratify=df["label"], random_state=seed)
+        train, val = train_test_split(
+            train_val, test_size=val_of_rest, stratify=train_val["label"], random_state=seed)
+    else:
+        raise ValueError(f"Unknown split mode: {mode}")
+
+    if split_csv:
+        cols = ["rel_path", "label", "source"]
+        out = pd.concat([train[cols].assign(split="train"),
+                         val[cols].assign(split="val"),
+                         test[cols].assign(split="test")])
+        Path(split_csv).parent.mkdir(parents=True, exist_ok=True)
+        out.to_csv(split_csv, index=False)
+        print(f"Saved new '{mode}' split to {split_csv} (commit this file to git).")
+    parts = [d.reset_index(drop=True) for d in (train, val, test)]
+    print(f"Split sizes: train={len(parts[0])} val={len(parts[1])} test={len(parts[2])}")
+    print(pd.crosstab(pd.concat([p["label"] for p in parts], ignore_index=True),
+                      pd.concat([p.assign(s=n)["s"] for p, n in zip(parts, ("train", "val", "test"))],
+                                ignore_index=True))[["train", "val", "test"]].to_string())
+    return tuple(parts)
+
+
+def subsample_per_class(df, n, seed=42):
+    """Keep at most n images per class (for smoke tests now, few-shot experiments later)."""
+    parts = [g.sample(min(len(g), n), random_state=seed) for _, g in df.groupby("label")]
+    return pd.concat(parts)
+
+
+def class_weights(df, class_names):
+    """Balanced class weights as a {class_index: weight} dict for model.fit."""
+    labels = df[df["label"].isin(class_names)]["label"].map({c: i for i, c in enumerate(class_names)})
+    w = compute_class_weight("balanced", classes=np.arange(len(class_names)), y=labels.values)
+    return {i: float(x) for i, x in enumerate(w)}
+
+
+# ----------------------------------------------------------------------------
+# tf.data pipeline
+# ----------------------------------------------------------------------------
+def preprocess(img, backbone="vgg16"):
+    """Preprocess a float32 [0, 255] image tensor for the given backbone (see backbones.py).
+    Any inference code later (new images, deployment) must apply the same function."""
+    return backbones.get(backbone).preprocess(img)
+
+
+def make_dataset(df, class_names, img_size=224, batch_size=32, training=False,
+                 cache=False, seed=42, backbone="vgg16"):
+    """Build a batched dataset of (preprocessed image, integer label).
+
+    class_names defines the label order AND which classes are included, so the same function
+    handles the full 3-class problem and the held-out-class experiments later:
+        class_names=["healthy", "black_sigatoka"]  # fusarium_wilt rows are dropped here
+    Evaluation datasets are NOT shuffled, so predictions line up with df's row order.
+    backbone: which encoder's preprocessing to apply (see backbones.py).
+    """
+    df = df[df["label"].isin(class_names)]
+    idx = {c: i for i, c in enumerate(class_names)}
+    paths = df["path"].values
+    labels = df["label"].map(idx).values.astype("int32")
+    load_size = int(round(img_size * CROP_SCALE)) if training else img_size
+
+    def _load(path, label):
+        img = tf.io.decode_image(tf.io.read_file(path), channels=3, expand_animations=False)
+        img = tf.image.resize(img, [load_size, load_size], antialias=True)  # squashes 4:3 to square
+        return tf.saturate_cast(img, tf.uint8), label
+
+    def _augment(img, label):
+        img = tf.image.random_crop(img, [img_size, img_size, 3])
+        img = tf.image.random_flip_left_right(img)
+        img = tf.image.random_flip_up_down(img)
+        img = tf.cast(img, tf.float32)
+        img = tf.image.random_brightness(img, 0.15 * 255)
+        img = tf.image.random_contrast(img, 0.85, 1.15)
+        return tf.clip_by_value(img, 0.0, 255.0), label
+
+    def _to_float(img, label):
+        return tf.cast(img, tf.float32), label
+
+    ds = tf.data.Dataset.from_tensor_slices((paths, labels))
+    if training and not cache:
+        ds = ds.shuffle(len(paths), seed=seed, reshuffle_each_iteration=True)  # shuffle paths: cheap
+    ds = ds.map(_load, num_parallel_calls=AUTOTUNE)
+    if cache:
+        ds = ds.cache()  # caches resized uint8 images in RAM (~1.7 GB for 11k images at 224px)
+        if training:
+            ds = ds.shuffle(1000, seed=seed, reshuffle_each_iteration=True)
+    ds = ds.map(_augment if training else _to_float, num_parallel_calls=AUTOTUNE)
+    pre = backbones.get(backbone).preprocess  # each encoder expects its own input scaling
+    ds = ds.map(lambda x, y: (pre(x), y), num_parallel_calls=AUTOTUNE)
+    return ds.batch(batch_size).prefetch(AUTOTUNE)
